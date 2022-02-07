@@ -5,13 +5,17 @@ import akka.actor.typed.ActorSystem
 import akka.actor.typed.scaladsl.Behaviors
 import akka.stream.scaladsl.{Flow, FlowWithContext, RestartFlow, RunnableGraph, Sink, Source}
 import akka.stream.{Materializer, RestartSettings}
-import less.stupid.streams.aws.domain.OffsetWriter.{OffsetWriterError, OffsetWriterException}
-import less.stupid.streams.aws.domain.{KinesisContext, KinesisOffsetWritingFlow, KinesisProcessingFlow, OffsetWriter}
+import less.stupid.streams.aws.domain.{KinesisContext, KinesisProcessingFlow}
 import less.stupid.streams.aws.infrastructure.{KinesisStream, SuccessfulOffsetWriter}
 import less.stupid.streams.domain.Decoder.{DecodingError, UnableToDecodeBecauseItsHardcodedToFail}
 import less.stupid.streams.domain.Service.{ServiceCallFailedBecauseSomeWeirdThingHappened, ServiceError}
 import less.stupid.streams.domain._
 import less.stupid.streams.infrastructure.{SometimesFailingService, SuccessfulDecoder}
+import less.stupid.streams.streams.domain.OffsetWriter
+import less.stupid.streams.streams.domain.OffsetWriter.{OffsetWriterError, OffsetWriterException}
+import less.stupid.streams.streams.domain.OffsetWritingMessageStream.{OffsetWritingFlow, OffsetWritingProcessingFlow}
+import less.stupid.streams.streams.infrastructure.MessageFlow.{MessageFlow, mapAsyncErrorOr}
+import less.stupid.streams.streams.infrastructure.OffsetWritingStream
 import org.slf4j.LoggerFactory
 
 import scala.concurrent.duration._
@@ -44,37 +48,11 @@ object Main {
     val processingFlow: KinesisProcessingFlow[DomainError, EncodedMessage] =
       FlowWithContext[EncodedMessage, KinesisContext]
         .mapAsync(1)(decoder.decode)
-        .mapAsync(1) {
-          case Left(error)           => Future.successful(Left(error))
-          case Right(decodedMessage) => service.send(ServiceRequest(decodedMessage))
-        }
-        .map {
-          case Right(_) => Right(())
-          case Left(e)  => Left(e)
-        }
+        .via(mapAsyncErrorOr(1)(decodedMessage => service.send(ServiceRequest(decodedMessage))))
 
     val graph = KinesisStream(source, KinesisContext, processingFlow, offsetWriter, restartSettings)
 
     graph.run()
-  }
-
-  object MessageFlow {
-
-    type MessageFlow[Error, Context, In, Out] = FlowWithContext[Either[Error, In], Context, Either[Error, Out], Context, NotUsed]
-
-    def toUnit[Error, Context]: MessageFlow[Error, Context, _, Unit] = {
-      FlowWithContext[Either[Error, _], Context].map {
-        case Right(_) => Right(())
-        case Left(e) => Left(e)
-      }
-    }
-
-    def mapAsync[Error, Context, In, Out](parallelism: Int)(block: In => Future[Either[Error, Out]]): MessageFlow[Error, Context, In, Out] = {
-      FlowWithContext[Either[Error, In], Context].mapAsync(parallelism) {
-        case Left(error) => Future.successful(Left(error))
-        case Right(elem) => block(elem)
-      }
-    }
   }
 }
 
@@ -153,14 +131,58 @@ object aws {
 
     case class KinesisContext(value: EncodedMessage)
 
-    type KinesisOffsetWritingFlow[Error] = Flow[(Either[Error, Unit], KinesisContext), Unit, NotUsed]
-    type KinesisProcessingFlow[Error, In] =
-      FlowWithContext[In, KinesisContext, Either[Error, Unit], KinesisContext, NotUsed]
+    type KinesisOffsetWritingFlow[Error] = OffsetWritingFlow[Error, KinesisContext]
+    type KinesisProcessingFlow[Error, In] = OffsetWritingProcessingFlow[Error, KinesisContext, In]
+  }
+
+  object infrastructure {
+
+    class SuccessfulOffsetWriter extends OffsetWriter {
+
+      private val log = LoggerFactory.getLogger(getClass)
+
+      override def writeOffsetForContext[Error, Context](
+          errorOr: Either[Error, Unit],
+          context: Context): Future[Either[OffsetWriterError, Unit]] = {
+        errorOr match {
+          case Left(error) => log.info(s"Writing offset for failing flow element [error=$error]")
+          case Right(_)    => log.info(s"Writing offset for successful flow element")
+        }
+
+        Future.successful(Right(()))
+      }
+    }
+
+    object KinesisStream {
+
+      def apply[Error, Context, In](
+          source: Source[In, NotUsed],
+          contextProvider: In => KinesisContext,
+          processingFlow: KinesisProcessingFlow[Error, In],
+          offsetWriter: OffsetWriter,
+          restartSettings: RestartSettings)(implicit
+          ec: ExecutionContext,
+          mat: Materializer): RunnableGraph[NotUsed] =
+        OffsetWritingStream(source, contextProvider, processingFlow, offsetWriter, restartSettings)
+    }
+  }
+}
+
+object streams {
+
+  object domain {
+
+    object OffsetWritingMessageStream {
+
+      type OffsetWritingFlow[Error, Context] = Flow[(Either[Error, Unit], Context), Unit, NotUsed]
+      type OffsetWritingProcessingFlow[Error, Context, In] =
+        FlowWithContext[In, Context, Either[Error, _], Context, NotUsed]
+    }
 
     trait OffsetWriter {
-      def writeOffsetForContext[Error](
+      def writeOffsetForContext[Error, Context](
           errorOrMessage: Either[Error, Unit],
-          context: KinesisContext): Future[Either[OffsetWriterError, Unit]]
+          context: Context): Future[Either[OffsetWriterError, Unit]]
     }
 
     object OffsetWriter {
@@ -172,28 +194,67 @@ object aws {
 
   object infrastructure {
 
-    class SuccessfulOffsetWriter extends OffsetWriter {
+    object MessageFlow {
+
+      type MessageFlow[Error, Context, In, Out] =
+        FlowWithContext[Either[Error, In], Context, Either[Error, Out], Context, NotUsed]
+
+      /**
+       * Either[Error, IncomingMessage] => Either[Error, OutgoingMessage]
+       *
+       * If it receives a `Left` it just propagates forward.
+       * If it receives a `Right` it invokes `block` and passes the value of `Right` as the argument.
+       */
+      def mapAsyncErrorOr[Error, Context, In, Out](parallelism: Int)(
+          block: In => Future[Either[Error, Out]]): MessageFlow[Error, Context, In, Out] =
+        FlowWithContext[Either[Error, In], Context].mapAsync(parallelism) {
+          case Left(error) => Future.successful(Left(error))
+          case Right(elem) => block(elem)
+        }
+    }
+
+    object OffsetWritingStream {
 
       private val log = LoggerFactory.getLogger(getClass)
 
-      override def writeOffsetForContext[Error](
-          errorOr: Either[Error, Unit],
-          context: domain.KinesisContext): Future[Either[OffsetWriterError, Unit]] = {
-        errorOr match {
-          case Left(error) => log.info(s"Writing offset for failing flow element [error=$error]")
-          case Right(_)    => log.info(s"Writing offset for successful flow element")
-        }
+      def apply[Error, Context, In](
+                                     source: Source[In, NotUsed],
+                                     contextProvider: In => Context,
+                                     processingFlow: OffsetWritingProcessingFlow[Error, Context, In],
+                                     offsetWriter: OffsetWriter,
+                                     restartSettings: RestartSettings)(implicit
+          ec: ExecutionContext,
+          mat: Materializer): RunnableGraph[NotUsed] = {
+        val offsetWritingFlow = OffsetWritingFlow[Error, Context](offsetWriter, restartSettings)
+        source
+          .asSourceWithContext(contextProvider)
+          .via(processingFlow)
+          .asSource
+          .via(toUnit)
+          .via(offsetWritingFlow)
+          .to(Sink.foreach(_ => log.info("processing complete")))
+      }
 
-        Future.successful(Right(()))
+      /**
+       * Convenience for mapping anything in a `Right` to a `Right(Unit)`
+       * We _might_ need to know whether the processing of the message was successful or not,
+       * but we don't need to know anything about the message itself (that would also cause
+       * problems with leaking domain knowledge into this AWS package/module.
+       */
+      def toUnit[Error, Context, In]: MessageFlow[Error, Context, In, Unit] = {
+        FlowWithContext[Either[Error, _], Context].map {
+          case Right(_) => Right(())
+          case Left(e)  => Left(e)
+        }
       }
     }
 
-    object KinesisOffsetWritingFlow {
+    object OffsetWritingFlow {
 
-      def apply[Error](offsetWriter: OffsetWriter, restartSettings: RestartSettings)(implicit
-          ec: ExecutionContext): KinesisOffsetWritingFlow[Error] =
+      def apply[Error, Context](offsetWriter: OffsetWriter, restartSettings: RestartSettings)(implicit
+          ec: ExecutionContext): OffsetWritingFlow[Error, Context] =
         RestartFlow.onFailuresWithBackoff(restartSettings) { () =>
-          Flow[(Either[Error, Unit], KinesisContext)].mapAsync(1) {
+          Flow[(Either[Error, Unit], Context)].mapAsync(1) {
             case (errorOrMessage, context) =>
               offsetWriter.writeOffsetForContext(errorOrMessage, context).map {
                 case Left(error) => throw new OffsetWriterException(error)
@@ -201,28 +262,6 @@ object aws {
               }
           }
         }
-    }
-
-    object KinesisStream {
-
-      private val log = LoggerFactory.getLogger(getClass)
-
-      def apply[Error, In](
-          source: Source[In, NotUsed],
-          contextProvider: In => KinesisContext,
-          processingFlow: KinesisProcessingFlow[Error, In],
-          offsetWriter: OffsetWriter,
-          restartSettings: RestartSettings)(implicit
-          ec: ExecutionContext,
-          mat: Materializer): RunnableGraph[NotUsed] = {
-        val offsetWritingFlow = KinesisOffsetWritingFlow[Error](offsetWriter, restartSettings)
-        source
-          .asSourceWithContext(contextProvider)
-          .via(processingFlow)
-          .asSource
-          .via(offsetWritingFlow)
-          .to(Sink.foreach(_ => log.info("processing complete")))
-      }
     }
   }
 }
