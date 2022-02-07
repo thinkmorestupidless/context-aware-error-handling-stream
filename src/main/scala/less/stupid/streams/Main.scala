@@ -1,9 +1,9 @@
 package less.stupid.streams
 
-import akka.NotUsed
+import akka.{Done, NotUsed}
 import akka.actor.typed.ActorSystem
 import akka.actor.typed.scaladsl.Behaviors
-import akka.stream.scaladsl.{Flow, FlowWithContext, RestartFlow, RunnableGraph, Sink, Source}
+import akka.stream.scaladsl.{Flow, FlowWithContext, Keep, RestartFlow, RunnableGraph, Sink, Source}
 import akka.stream.{Materializer, RestartSettings}
 import less.stupid.streams.aws.domain.{KinesisContext, KinesisProcessingFlow}
 import less.stupid.streams.aws.infrastructure.{KinesisStream, SuccessfulOffsetWriter}
@@ -20,9 +20,11 @@ import org.slf4j.LoggerFactory
 
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future}
-import scala.util.Random
+import scala.util.{Failure, Random, Success}
 
 object Main {
+
+  private val log = LoggerFactory.getLogger(getClass)
 
   def main(args: Array[String]): Unit = {
 
@@ -58,7 +60,13 @@ object Main {
     // about how to pass through these kinds of settings...
     val graph = KinesisStream(source, KinesisContext, processingFlow, offsetWriter, restartSettings)
 
-    graph.run()
+    graph.run().onComplete {
+      case Success(_) => System.exit(0)
+      case Failure(e) => {
+        log.info(s"Stream failed [reason=$e]")
+        System.exit(1)
+      }
+    }
   }
 }
 
@@ -168,7 +176,7 @@ object aws {
           offsetWriter: OffsetWriter,
           restartSettings: RestartSettings)(implicit
           ec: ExecutionContext,
-          mat: Materializer): RunnableGraph[NotUsed] =
+          mat: Materializer): RunnableGraph[Future[Done]] =
         OffsetWritingStream(source, contextProvider, processingFlow, offsetWriter, restartSettings)
     }
   }
@@ -230,7 +238,7 @@ object messaging {
                                      offsetWriter: OffsetWriter,
                                      restartSettings: RestartSettings)(implicit
           ec: ExecutionContext,
-          mat: Materializer): RunnableGraph[NotUsed] = {
+          mat: Materializer): RunnableGraph[Future[Done]] = {
         val offsetWritingFlow = OffsetWritingFlow[Error, Context](offsetWriter, restartSettings)
         source
           .asSourceWithContext(contextProvider)
@@ -238,7 +246,7 @@ object messaging {
           .asSource
           .via(toUnit)
           .via(offsetWritingFlow)
-          .to(Sink.foreach(_ => log.info("processing complete")))
+          .toMat(Sink.foreach(_ => log.info("processing complete")))(Keep.right)
       }
 
       /**
