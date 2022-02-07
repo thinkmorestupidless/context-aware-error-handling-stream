@@ -11,11 +11,11 @@ import less.stupid.streams.domain.Decoder.{DecodingError, UnableToDecodeBecauseI
 import less.stupid.streams.domain.Service.{ServiceCallFailedBecauseSomeWeirdThingHappened, ServiceError}
 import less.stupid.streams.domain._
 import less.stupid.streams.infrastructure.{SometimesFailingService, SuccessfulDecoder}
-import less.stupid.streams.streams.domain.OffsetWriter
-import less.stupid.streams.streams.domain.OffsetWriter.{OffsetWriterError, OffsetWriterException}
-import less.stupid.streams.streams.domain.OffsetWritingMessageStream.{OffsetWritingFlow, OffsetWritingProcessingFlow}
-import less.stupid.streams.streams.infrastructure.MessageFlow.{MessageFlow, mapAsyncErrorOr}
-import less.stupid.streams.streams.infrastructure.OffsetWritingStream
+import less.stupid.streams.messaging.domain.OffsetWriter
+import less.stupid.streams.messaging.domain.OffsetWriter.{OffsetWriterError, OffsetWriterException}
+import less.stupid.streams.messaging.domain.OffsetWritingMessageStream.{OffsetWritingFlow, OffsetWritingProcessingFlow}
+import less.stupid.streams.messaging.infrastructure.MessageFlow.{MessageFlow, mapAsyncErrorOr}
+import less.stupid.streams.messaging.infrastructure.OffsetWritingStream
 import org.slf4j.LoggerFactory
 
 import scala.concurrent.duration._
@@ -50,6 +50,12 @@ object Main {
         .mapAsync(1)(decoder.decode)
         .via(mapAsyncErrorOr(1)(decodedMessage => service.send(ServiceRequest(decodedMessage))))
 
+    // take a Source[EncodedMessage, _]
+    // create a context for the message (here, we're just wrapping it in `KinesisContext`)
+    // run it through the processing steps above
+    // write the offset
+    // ... restart settings for the offset writing - not required for the PoC, but useful for thinking
+    // about how to pass through these kinds of settings...
     val graph = KinesisStream(source, KinesisContext, processingFlow, offsetWriter, restartSettings)
 
     graph.run()
@@ -168,7 +174,7 @@ object aws {
   }
 }
 
-object streams {
+object messaging {
 
   object domain {
 
@@ -255,8 +261,8 @@ object streams {
           ec: ExecutionContext): OffsetWritingFlow[Error, Context] =
         RestartFlow.onFailuresWithBackoff(restartSettings) { () =>
           Flow[(Either[Error, Unit], Context)].mapAsync(1) {
-            case (errorOrMessage, context) =>
-              offsetWriter.writeOffsetForContext(errorOrMessage, context).map {
+            case (errorOr, context) =>
+              offsetWriter.writeOffsetForContext(errorOr, context).map {
                 case Left(error) => throw new OffsetWriterException(error)
                 case Right(_)    => ()
               }
