@@ -57,6 +57,25 @@ object Main {
 
     graph.run()
   }
+
+  object MessageFlow {
+
+    type MessageFlow[Error, Context, In, Out] = FlowWithContext[Either[Error, In], Context, Either[Error, Out], Context, NotUsed]
+
+    def toUnit[Error, Context]: MessageFlow[Error, Context, _, Unit] = {
+      FlowWithContext[Either[Error, _], Context].map {
+        case Right(_) => Right(())
+        case Left(e) => Left(e)
+      }
+    }
+
+    def mapAsync[Error, Context, In, Out](parallelism: Int)(block: In => Future[Either[Error, Out]]): MessageFlow[Error, Context, In, Out] = {
+      FlowWithContext[Either[Error, In], Context].mapAsync(parallelism) {
+        case Left(error) => Future.successful(Left(error))
+        case Right(elem) => block(elem)
+      }
+    }
+  }
 }
 
 object domain {
