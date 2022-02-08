@@ -232,11 +232,11 @@ object messaging {
       private val log = LoggerFactory.getLogger(getClass)
 
       def apply[Error, Context, In](
-                                     source: Source[In, NotUsed],
-                                     contextProvider: In => Context,
-                                     processingFlow: OffsetWritingProcessingFlow[Error, Context, In],
-                                     offsetWriter: OffsetWriter,
-                                     restartSettings: RestartSettings)(implicit
+          source: Source[In, NotUsed],
+          contextProvider: In => Context,
+          processingFlow: OffsetWritingProcessingFlow[Error, Context, In],
+          offsetWriter: OffsetWriter,
+          restartSettings: RestartSettings)(implicit
           ec: ExecutionContext,
           mat: Materializer): RunnableGraph[Future[Done]] = {
         val offsetWritingFlow = OffsetWritingFlow[Error, Context](offsetWriter, restartSettings)
@@ -255,12 +255,8 @@ object messaging {
        * but we don't need to know anything about the message itself (that would also cause
        * problems with leaking domain knowledge into this AWS package/module.
        */
-      def toUnit[Error, Context, In]: MessageFlow[Error, Context, In, Unit] = {
-        FlowWithContext[Either[Error, _], Context].map {
-          case Right(_) => Right(())
-          case Left(e)  => Left(e)
-        }
-      }
+      def toUnit[Error, Context, In]: MessageFlow[Error, Context, In, Unit] =
+        FlowWithContext[Either[Error, _], Context].map(_.map(_ => ()))
     }
 
     object OffsetWritingFlow {
